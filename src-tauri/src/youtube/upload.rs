@@ -1,0 +1,597 @@
+use super::{account, http, metadata_path, token_request, Account};
+use crate::db::Database;
+use reqwest::{
+    header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE, RETRY_AFTER},
+    Client, Response,
+};
+use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use url::Url;
+
+const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+pub async fn supervise(db: Database) {
+    let client = match http() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("ClipForge YouTube client failed: {error}");
+            return;
+        }
+    };
+    loop {
+        if let Err(error) = attempt_one(&db, &client).await {
+            eprintln!("ClipForge upload worker: {error}");
+        }
+        if let Err(error) = super::cleanup::check_one(&db, &client).await {
+            eprintln!("ClipForge publication cleanup: {error}");
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+#[derive(Debug)]
+struct Job {
+    id: i64,
+    path: PathBuf,
+    uri: Option<String>,
+    channel: Option<String>,
+    size: Option<u64>,
+    may_have_committed: bool,
+    attempts: u32,
+}
+
+#[derive(Deserialize)]
+struct Metadata {
+    #[serde(default)]
+    quality_version: u32,
+    title: String,
+    description: String,
+}
+
+enum TransferError {
+    Retry(String, Option<u64>),
+    Stop(String),
+    Uncertain,
+    Local(String),
+}
+
+fn next_job(db: &Database) -> rusqlite::Result<Option<Job>> {
+    db.connection()?
+        .query_row(
+            "SELECT p.clip_id,j.output_path,p.upload_session,
+        p.channel_id,p.file_size,p.may_have_committed,p.attempts
+        FROM publishing_jobs p JOIN clip_jobs j ON j.id=p.clip_id
+        WHERE p.status IN ('queued','retry','uploading')
+         AND (p.retry_at IS NULL OR p.retry_at <= unixepoch())
+         AND j.status = 'ready' AND j.output_path IS NOT NULL
+         AND NOT EXISTS(SELECT 1 FROM uploaded_videos u WHERE u.clip_id=p.clip_id)
+        ORDER BY p.clip_id LIMIT 1",
+            [],
+            |row| {
+                Ok(Job {
+                    id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    uri: row.get(2)?,
+                    channel: row.get(3)?,
+                    size: row.get(4)?,
+                    may_have_committed: row.get(5)?,
+                    attempts: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+}
+
+async fn attempt_one(db: &Database, client: &Client) -> Result<(), String> {
+    if !db.settings()?.auto_publish {
+        return Ok(());
+    }
+    let Some(account) = account()? else {
+        return Ok(());
+    };
+    let Some(mut job) = next_job(db).map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    let result = upload(db, client, &account, &mut job).await;
+    let (state, message, delay) = match result {
+        Ok(()) => return Ok(()),
+        Err(TransferError::Local(error)) => return Err(error),
+        Err(TransferError::Uncertain) => (
+            "uncertain",
+            "The prior upload may have completed. Check YouTube Studio before taking any action."
+                .into(),
+            None,
+        ),
+        Err(TransferError::Stop(error)) => ("failed", error, None),
+        Err(TransferError::Retry(error, delay)) => {
+            let delay = delay.unwrap_or_else(|| (15 * 2_u64.pow(job.attempts.min(8))).min(3600));
+            ("retry", error, Some(delay.min(86_400)))
+        }
+    };
+    db.connection()
+        .and_then(|connection| {
+            connection.execute(
+                "UPDATE publishing_jobs
+        SET status=?2,error=?3,retry_at=CASE WHEN ?4 IS NULL THEN NULL ELSE unixepoch()+?4 END,
+        attempts=attempts+1 WHERE clip_id=?1",
+                params![job.id, state, message, delay],
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn upload(
+    db: &Database,
+    client: &Client,
+    account: &Account,
+    job: &mut Job,
+) -> Result<(), TransferError> {
+    use TransferError::{Local, Retry, Stop, Uncertain};
+    if job
+        .channel
+        .as_ref()
+        .is_some_and(|id| id != &account.channel_id)
+    {
+        return Err(Stop(
+            "This upload belongs to another YouTube channel.".into(),
+        ));
+    }
+    let mut file = tokio::fs::File::open(&job.path)
+        .await
+        .map_err(|_| Stop("The validated Short file is missing.".into()))?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|error| Stop(error.to_string()))?
+        .len();
+    if size == 0 || job.size.is_some_and(|expected| expected != size) {
+        return Err(Stop("The Short file changed after uploading began.".into()));
+    }
+    let metadata = read_metadata(&job.path).await?;
+    let token = token_request(
+        client,
+        &account.desktop,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", account.refresh_token.as_str()),
+        ],
+    )
+    .await
+    .map_err(|error| Retry(error, Some(300)))?
+    .access_token;
+
+    let mut offset = 0;
+    let mut uri = if let Some(uri) = &job.uri {
+        let uri = session_url(uri)?;
+        let response = client
+            .put(uri.clone())
+            .bearer_auth(&token)
+            .header(CONTENT_LENGTH, 0)
+            .header(CONTENT_RANGE, format!("bytes */{size}"))
+            .send()
+            .await
+            .map_err(|_| Retry("Cannot reach YouTube to resume the upload.".into(), None))?;
+        match response.status().as_u16() {
+            200 | 201 => return complete(db, job.id, &metadata.title, response).await,
+            308 => {
+                offset = received(&response, size)?;
+                track(
+                    db,
+                    job.id,
+                    offset,
+                    Some(uri.as_str()),
+                    job.may_have_committed,
+                )?;
+                uri
+            }
+            404 | 410 if job.may_have_committed => return Err(Uncertain),
+            404 | 410 => start(db, client, account, job.id, &token, &metadata, size).await?,
+            _ => return Err(api_error(response).await),
+        }
+    } else {
+        start(db, client, account, job.id, &token, &metadata, size).await?
+    };
+
+    let mut buffer = vec![0; CHUNK_SIZE];
+    while offset < size {
+        if !db.settings().map_err(Local)?.auto_publish {
+            return Ok(());
+        }
+        if super::account()
+            .map_err(Local)?
+            .as_ref()
+            .map(|value| value.channel_id.as_str())
+            != Some(account.channel_id.as_str())
+        {
+            return Err(Stop(
+                "The connected YouTube channel changed during upload.".into(),
+            ));
+        }
+        let length = (size - offset).min(CHUNK_SIZE as u64) as usize;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|error| Stop(error.to_string()))?;
+        file.read_exact(&mut buffer[..length])
+            .await
+            .map_err(|error| Stop(error.to_string()))?;
+        let end = offset + length as u64;
+        let final_chunk = end == size;
+        if final_chunk {
+            // A crash after this point could leave a committed video and no local response.
+            track(db, job.id, offset, Some(uri.as_str()), true)?;
+            job.may_have_committed = true;
+        }
+        let response = client
+            .put(uri.clone())
+            .bearer_auth(&token)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_LENGTH, length)
+            .header(CONTENT_RANGE, format!("bytes {offset}-{}/{size}", end - 1))
+            .body(buffer[..length].to_vec())
+            .send()
+            .await
+            .map_err(|_| {
+                Retry(
+                    "Upload interrupted. ClipForge will check the same session before resuming."
+                        .into(),
+                    None,
+                )
+            })?;
+        match response.status().as_u16() {
+            200 | 201 => return complete(db, job.id, &metadata.title, response).await,
+            308 => {
+                if let Some(location) = response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    uri = session_url(location)?;
+                }
+                let received = received(&response, size)?;
+                track(
+                    db,
+                    job.id,
+                    received,
+                    Some(uri.as_str()),
+                    job.may_have_committed,
+                )?;
+                if received <= offset {
+                    return Err(Retry("YouTube made no upload progress.".into(), None));
+                }
+                offset = received;
+            }
+            404 | 410 if job.may_have_committed => return Err(Uncertain),
+            404 | 410 => {
+                return Err(Retry(
+                    "The upload session expired. ClipForge will renew it.".into(),
+                    None,
+                ))
+            }
+            _ => return Err(api_error(response).await),
+        }
+    }
+    Err(Retry("YouTube is finalizing the upload.".into(), None))
+}
+
+async fn read_metadata(path: &Path) -> Result<Metadata, TransferError> {
+    let path = metadata_path(path).map_err(TransferError::Stop)?;
+    let json = tokio::fs::read(path)
+        .await
+        .map_err(|_| TransferError::Stop("YouTube metadata is missing.".into()))?;
+    serde_json::from_slice(&json)
+        .map_err(|_| TransferError::Stop("YouTube metadata is invalid.".into()))
+}
+
+fn passes_minimum(confidence: Option<f64>, minimum: u32) -> bool {
+    confidence.is_some_and(|value| value >= f64::from(minimum.max(80)))
+}
+
+async fn start(
+    db: &Database,
+    client: &Client,
+    account: &Account,
+    id: i64,
+    token: &str,
+    metadata: &Metadata,
+    size: u64,
+) -> Result<Url, TransferError> {
+    if metadata.quality_version != 2 {
+        return Err(TransferError::Stop(
+            "Held for review: this clip lacks a passing highlight quality check.".into(),
+        ));
+    }
+    let settings = db.settings().map_err(TransferError::Local)?;
+    let confidence: Option<f64> = db.connection().and_then(|conn| conn.query_row(
+        "SELECT h.confidence FROM clip_jobs j JOIN highlight_events h ON h.id=j.highlight_id WHERE j.id=?1",
+        [id], |row| row.get(0),
+    )).map_err(|err| TransferError::Local(err.to_string()))?;
+    if !settings.auto_publish || !passes_minimum(confidence, settings.minimum_confidence) {
+        return Err(TransferError::Retry(
+            "Waiting for current publishing preferences to allow this clip.".into(),
+            Some(300),
+        ));
+    }
+    let response = client
+        .post("https://www.googleapis.com/upload/youtube/v3/videos")
+        .query(&[("part", "snippet,status"), ("uploadType", "resumable")])
+        .bearer_auth(token)
+        .header("X-Upload-Content-Length", size)
+        .header("X-Upload-Content-Type", "video/mp4")
+        .json(&serde_json::json!({
+            "snippet": {"title": metadata.title, "description": metadata.description},
+            "status": {"privacyStatus": "public"},
+        }))
+        .send()
+        .await
+        .map_err(|_| {
+            TransferError::Retry("Could not start the YouTube upload session.".into(), None)
+        })?;
+    if !response.status().is_success() {
+        return Err(api_error(response).await);
+    }
+    let url = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            TransferError::Retry("YouTube omitted the resumable upload URL.".into(), None)
+        })?;
+    let uri = session_url(url)?;
+    db.connection()
+        .and_then(|connection| {
+            connection.execute(
+                "UPDATE publishing_jobs
+        SET status='uploading', upload_session=?2, uploaded_bytes=0, channel_id=?3,
+        file_size=?4, may_have_committed=0, error=NULL, retry_at=NULL WHERE clip_id=?1",
+                params![id, uri.as_str(), account.channel_id, size],
+            )
+        })
+        .map_err(|error| TransferError::Local(error.to_string()))?;
+    Ok(uri)
+}
+
+fn track(
+    db: &Database,
+    id: i64,
+    uploaded: u64,
+    uri: Option<&str>,
+    may_have_committed: bool,
+) -> Result<(), TransferError> {
+    db.connection().and_then(|connection| connection.execute("UPDATE publishing_jobs
+        SET status='uploading', uploaded_bytes=?2,upload_session=?3,may_have_committed=?4 WHERE clip_id=?1",
+        params![id,uploaded,uri,may_have_committed]))
+        .map(|_| ()).map_err(|error| TransferError::Local(error.to_string()))
+}
+
+async fn complete(
+    db: &Database,
+    id: i64,
+    title: &str,
+    response: Response,
+) -> Result<(), TransferError> {
+    let video: serde_json::Value = response.json().await.map_err(|_| {
+        TransferError::Retry(
+            "YouTube returned an unreadable completion response.".into(),
+            None,
+        )
+    })?;
+    let video_id = video["id"]
+        .as_str()
+        .filter(|id| {
+            id.len() == 11
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        .ok_or_else(|| {
+            TransferError::Retry("YouTube did not return a valid video ID.".into(), None)
+        })?;
+    let mut connection = db
+        .connection()
+        .map_err(|error| TransferError::Local(error.to_string()))?;
+    let tx = connection
+        .transaction()
+        .map_err(|error| TransferError::Local(error.to_string()))?;
+    tx.execute(
+        "INSERT INTO uploaded_videos(clip_id,video_id,title,published_at)
+        VALUES(?1,?2,?3,unixepoch()) ON CONFLICT(clip_id) DO NOTHING",
+        params![id, video_id, title],
+    )
+    .map_err(|error| TransferError::Local(error.to_string()))?;
+    tx.execute(
+        "UPDATE publishing_jobs SET status='uploaded',upload_session=NULL,uploaded_bytes=file_size,
+        retry_at=NULL,error=NULL WHERE clip_id=?1",
+        [id],
+    )
+    .map_err(|error| TransferError::Local(error.to_string()))?;
+    tx.execute(
+        "INSERT OR IGNORE INTO publication_cleanup(clip_id) VALUES(?1)",
+        [id],
+    )
+    .map_err(|error| TransferError::Local(error.to_string()))?;
+    tx.commit()
+        .map_err(|error| TransferError::Local(error.to_string()))
+}
+
+fn session_url(value: &str) -> Result<Url, TransferError> {
+    let uri = Url::parse(value)
+        .map_err(|_| TransferError::Stop("Invalid YouTube upload session URL.".into()))?;
+    if uri.scheme() != "https"
+        || uri.username() != ""
+        || uri.password().is_some()
+        || uri.port_or_known_default() != Some(443)
+        || !matches!(
+            uri.host_str(),
+            Some("www.googleapis.com" | "youtube.googleapis.com")
+        )
+        || uri.path() != "/upload/youtube/v3/videos"
+    {
+        return Err(TransferError::Stop(
+            "YouTube returned an unexpected upload session URL.".into(),
+        ));
+    }
+    Ok(uri)
+}
+
+fn received(response: &Response, size: u64) -> Result<u64, TransferError> {
+    let value = response
+        .headers()
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok());
+    parse_range(value, size)
+        .ok_or_else(|| TransferError::Stop("YouTube returned an invalid upload range.".into()))
+}
+
+fn parse_range(range: Option<&str>, size: u64) -> Option<u64> {
+    let Some(range) = range else {
+        return Some(0);
+    };
+    range
+        .strip_prefix("bytes=0-")?
+        .parse::<u64>()
+        .ok()?
+        .checked_add(1)
+        .filter(|received| *received <= size)
+}
+
+async fn api_error(response: Response) -> TransferError {
+    let code = response.status();
+    let delay = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let details: serde_json::Value = response.json().await.unwrap_or_default();
+    let reason = details["error"]["errors"][0]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    match reason {
+        "quotaExceeded" | "dailyLimitExceeded" => {
+            TransferError::Retry("YouTube API quota exhausted.".into(), Some(3600))
+        }
+        "uploadLimitExceeded" => TransferError::Retry(
+            "The channel reached its YouTube upload limit.".into(),
+            Some(3600),
+        ),
+        "rateLimitExceeded" | "userRateLimitExceeded" => {
+            TransferError::Retry("YouTube is rate limiting uploads.".into(), delay)
+        }
+        _ if code.is_server_error() || matches!(code.as_u16(), 401 | 429) => TransferError::Retry(
+            format!("YouTube upload temporarily failed ({code})."),
+            delay,
+        ),
+        _ => TransferError::Stop(format!(
+            "YouTube rejected this upload ({code}). Check channel and API permissions."
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fresh_sessions_follow_current_confidence_and_floor() {
+        assert!(!super::passes_minimum(Some(79.), 70));
+        assert!(!super::passes_minimum(Some(89.), 90));
+        assert!(super::passes_minimum(Some(89.), 85));
+        assert!(!super::passes_minimum(None, 80));
+    }
+
+    use super::*;
+
+    #[test]
+    fn respects_server_acknowledgment_ranges() {
+        assert_eq!(parse_range(None, 100), Some(0));
+        assert_eq!(parse_range(Some("bytes=0-49"), 100), Some(50));
+        assert_eq!(parse_range(Some("bytes=0-100"), 100), None);
+        assert_eq!(parse_range(Some("bytes=4-100"), 100), None);
+        assert!(
+            session_url("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1").is_ok()
+        );
+        assert!(
+            session_url("https://www.googleapis.com.evil.test/upload/youtube/v3/videos").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_final_chunk_fence_and_records_success_once() {
+        use tokio::io::AsyncWriteExt;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("upload-test.db");
+        let db = Database::open(&path).unwrap();
+        db.connection().unwrap().execute_batch(
+            "INSERT INTO creators (id, username,channel_url) VALUES(1,'test','https://www.twitch.tv/test');
+             INSERT INTO stream_sessions (id,creator_id,started_at) VALUES(1,1,1);
+             INSERT INTO highlight_events (id,session_id,triggered_at,score) VALUES(1,1,1,80);
+             INSERT INTO clip_jobs (id,highlight_id,status,output_path) VALUES(1,1,'ready','short.mp4');
+             INSERT INTO publishing_jobs (clip_id,status,file_size) VALUES(1,'uploading',100);"
+        ).unwrap();
+        track(
+            &db,
+            1,
+            70,
+            Some("https://www.googleapis.com/upload/youtube/v3/videos?upload_id=test"),
+            true,
+        )
+        .map_err(|_| "cannot persist fence")
+        .unwrap();
+        let reopened = Database::open(&path).unwrap();
+        let job = next_job(&reopened).unwrap().unwrap();
+        assert!(job.may_have_committed);
+        assert!(job.uri.unwrap().contains("upload_id=test"));
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let mock = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = r#"{"id":"abcdefghijk"}"#;
+                let reply = format!(
+                    "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let response = http()
+                .unwrap()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+            complete(&reopened, 1, "Test", response)
+                .await
+                .map_err(|_| "cannot complete upload")
+                .unwrap();
+            mock.await.unwrap();
+        }
+        assert!(next_job(&reopened).unwrap().is_none());
+        let count: i64 = reopened
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM uploaded_videos WHERE clip_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let pending: i64 = reopened
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM publication_cleanup WHERE clip_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+    }
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ClipForge Live",
+  "version": "0.4.0",
+  "identifier": "com.clipforge.live",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ClipForge Live",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 840,
+        "minHeight": 600,
+        "theme": "Dark"
+      }
+    ],
+    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "resources": ["worker/media.py", "worker/requirements.txt", "worker/face_detection_yunet_2023mar.onnx", "worker/YUNET-LICENSE.txt"],
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
+}
+
