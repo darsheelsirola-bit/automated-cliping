@@ -94,6 +94,12 @@ pub struct Clip {
     pub video_id: Option<String>,
     pub title: Option<String>,
     pub published_at: Option<i64>,
+    pub review_decision: Option<String>,
+    pub editorial_pass: Option<bool>,
+    pub editorial_notes: Option<String>,
+    pub retry_at: Option<i64>,
+    pub review_locked: bool,
+    pub can_reedit: bool,
 }
 
 #[derive(Debug, Serialize)]

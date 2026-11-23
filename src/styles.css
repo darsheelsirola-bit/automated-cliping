@@ -289,3 +289,22 @@ dialog::backdrop { background: #0009; }
 .chat-chart svg { display: block; width: 100%; height: 42px; max-width: 600px; margin-top: 4px; }
 .clip-file { display: flex; margin-top: 4px; font-size: 12px; }
 .clip-thumbnail { float: left; margin-right: 12px; border-radius: 4px; object-fit: cover; }
+
+.reel-review {
+  max-width: min(580px, 94vw);
+  max-height: 94vh;
+  width: 100%;
+  padding: 20px;
+  border: 1px solid #444;
+  border-radius: 12px;
+  background: #171717;
+  color: inherit;
+}
+.reel-review::backdrop { background: #000b; }
+.reel-review video { display: block; height: min(52vh, 540px); max-width: 100%; margin: 12px auto; background: #000; }
+.review-controls, .review-trim { display: grid; gap: 12px; }
+.review-trim { grid-template-columns: 1fr 1fr; }
+.review-trim input { width: 100%; }
+
+.review-controls .form-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.review-controls button, .reel-review .panel-heading button { padding: 6px 10px; border: 1px solid #484848; border-radius: 6px; }

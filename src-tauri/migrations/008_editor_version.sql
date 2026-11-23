@@ -1,0 +1,1 @@
+ALTER TABLE clip_jobs ADD COLUMN editor_version INTEGER NOT NULL DEFAULT 0;

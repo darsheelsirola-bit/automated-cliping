@@ -53,6 +53,7 @@ struct Token {
 pub struct Status {
     connected: bool,
     channel_title: Option<String>,
+    upload_retry_at: Option<i64>,
 }
 
 fn credential() -> Result<keyring::Entry, String> {
@@ -72,9 +73,17 @@ fn account() -> Result<Option<Account>, String> {
 }
 
 #[tauri::command]
-pub fn youtube_status() -> Result<Status, String> {
+pub fn youtube_status(db: State<'_, crate::db::Database>) -> Result<Status, String> {
     let account = account()?;
+    let upload_retry_at = if let Some(account) = &account {
+        db.connection()
+            .and_then(|conn| upload::channel_retry_at(&conn, &account.channel_id))
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
     Ok(Status {
+        upload_retry_at,
         connected: account.is_some(),
         channel_title: account.map(|value| value.channel_title),
     })
@@ -278,9 +287,13 @@ async fn channel(client: &Client, token: &str) -> Result<(String, String), Strin
 
 pub use upload::supervise;
 
-fn metadata_path(output: &Path) -> Result<std::path::PathBuf, String> {
+pub(crate) fn metadata_path(output: &Path) -> Result<std::path::PathBuf, String> {
     Ok(output
         .parent()
         .ok_or("The finished file has no storage folder.")?
-        .join("metadata.json"))
+        .join(if output.file_name().is_some_and(|name| name == "short-reedited.mp4") {
+            "metadata-reedited.json"
+        } else {
+            "metadata.json"
+        }))
 }

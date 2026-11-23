@@ -18,7 +18,7 @@ impl Database {
             conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 6 {
+        if version > 8 {
             return Err(rusqlite::Error::InvalidQuery);
         }
         if version == 0 {
@@ -46,6 +46,14 @@ impl Database {
             transaction.execute_batch(include_str!("../migrations/006_publication_cleanup.sql"))?;
             transaction.pragma_update(None, "user_version", 6)?;
         }
+        if version < 7 {
+            transaction.execute_batch(include_str!("../migrations/007_publish_controls.sql"))?;
+            transaction.pragma_update(None, "user_version", 7)?;
+        }
+        if version < 8 {
+            transaction.execute_batch(include_str!("../migrations/008_editor_version.sql"))?;
+            transaction.pragma_update(None, "user_version", 8)?;
+        }
         transaction.commit()?;
         Ok(database)
     }
@@ -61,7 +69,7 @@ impl Database {
         self.settings_with(&self.connection().map_err(db_error)?)
     }
 
-    fn settings_with(&self, conn: &Connection) -> Result<Settings, String> {
+    pub(crate) fn settings_with(&self, conn: &Connection) -> Result<Settings, String> {
         let json: Option<String> = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key = 'preferences'",
@@ -197,15 +205,17 @@ impl Database {
             creator_id: row.get(0)?, sampled_at: row.get(1)?, messages: row.get(2)?, unique_chatters: row.get(3)?,
         })).map_err(db_error)?;
         let clips = collect(&tx, "SELECT j.id, c.username, j.status, j.duration_ms, j.created_at, j.output_path, j.thumbnail_path,
-            j.error, t.status, r.status, p.status, p.error, p.uploaded_bytes, u.video_id, u.title, u.published_at
+            j.error, t.status, r.status, p.status, p.error, p.uploaded_bytes, u.video_id, u.title, u.published_at, v.decision, j.editorial_pass, j.editorial_notes, p.retry_at,
+            EXISTS(SELECT 1 FROM publishing_jobs q WHERE q.clip_id=j.id AND (q.status IN ('uploading','uploaded','uncertain') OR q.upload_session IS NOT NULL OR q.may_have_committed)), j.source_path IS NOT NULL AND j.work_dir IS NOT NULL AND j.editor_version=0
             FROM clip_jobs j JOIN highlight_events h ON h.id = j.highlight_id JOIN stream_sessions s ON s.id = h.session_id
             JOIN creators c ON c.id = s.creator_id LEFT JOIN transcription_jobs t ON t.clip_id = j.id
             LEFT JOIN render_jobs r ON r.clip_id = j.id LEFT JOIN publishing_jobs p ON p.clip_id = j.id
-            LEFT JOIN uploaded_videos u ON u.clip_id = j.id ORDER BY j.created_at DESC, j.id DESC LIMIT 300", |row| Ok(Clip {
+            LEFT JOIN uploaded_videos u ON u.clip_id = j.id LEFT JOIN clip_review v ON v.clip_id=j.id ORDER BY j.created_at DESC, j.id DESC LIMIT 300", |row| Ok(Clip {
             id: row.get(0)?, username: row.get(1)?, status: row.get(2)?, duration_ms: row.get(3)?, created_at: row.get(4)?,
             output_path: row.get(5)?, thumbnail_path: row.get(6)?, error: row.get(7)?, transcription_status: row.get(8)?,
             render_status: row.get(9)?, publishing_status: row.get(10)?, publishing_error: row.get(11)?,
             uploaded_bytes: row.get(12)?, video_id: row.get(13)?, title: row.get(14)?, published_at: row.get(15)?,
+            review_decision: row.get(16)?, editorial_pass: row.get(17)?, editorial_notes: row.get(18)?, retry_at: row.get(19)?, review_locked: row.get(20)?, can_reedit: row.get(21)?,
         })).map_err(db_error)?;
         let errors = collect(
             &tx,
@@ -311,7 +321,16 @@ mod tests {
         for (min, max, expected) in [(25, 60, (10, 45)), (15, 60, (15, 60)), (10, 10, (10, 10))] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("migration.db");
-            let db = Database::open(&path).unwrap();
+            let db = Database { path: path.clone() };
+            let connection = db.connection().unwrap();
+            for migration in [
+                include_str!("../migrations/001_initial.sql"),
+                include_str!("../migrations/002_publishing.sql"),
+                include_str!("../migrations/003_capture_and_processing.sql"),
+                include_str!("../migrations/004_media_locations.sql"),
+            ] {
+                connection.execute_batch(migration).unwrap();
+            }
             let mut settings = db.settings().unwrap();
             settings.min_clip_seconds = min;
             settings.max_clip_seconds = max;

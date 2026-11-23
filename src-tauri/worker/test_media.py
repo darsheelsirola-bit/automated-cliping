@@ -5,8 +5,9 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
-from media import metadata, caption_groups, choose_window, safe_layout, timestamp, write_captions
+from media import metadata, caption_groups, choose_window, gameplay_crop, safe_layout, select_edit, timestamp, write_captions
 
 
 class MediaTests(unittest.TestCase):
@@ -24,6 +25,49 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         self.assertLessEqual(groups[0][1], groups[1][0])
         self.assertEqual(timestamp(59.9996), "00:01:00,000")
+
+    def test_active_word_is_yellow_at_whisper_edges_only(self):
+        words = [
+            {"start": .2, "end": .5, "text": "Bigger"},
+            {"start": .6, "end": .9, "text": "reaction"},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root)
+            write_captions(target, words, 2)
+            events = [line for line in (target / "captions.ass").read_text(encoding="utf-8").splitlines()
+                      if line.startswith("Dialogue:")]
+            self.assertEqual(len(events), 3)
+            yellow = chr(92) + "1c&H00E8FF&"
+            self.assertIn("0:00:00.20,0:00:00.50", events[0])
+            self.assertIn(yellow + "}Bigger", events[0])
+            self.assertNotIn(yellow, events[1])
+            self.assertIn("0:00:00.60,0:00:00.90", events[2])
+            self.assertIn(yellow + "}reaction", events[2])
+
+    def test_repair_changes_dark_opening_and_trims_after_payoff(self):
+        job = {"creator": "Example", "min_seconds": 10, "max_seconds": 30}
+        evidence = {"peak": 16, "release": 19, "surge": True}
+        words = [dict(start=16+i*.15, end=16.15+i*.15, text=text, confidence=.96)
+                 for i,text in enumerate(("Can", "you", "believe", "that?"))]
+        with patch("media.usable_picture", side_effect=lambda _, left, *args: left >= 10.5):
+            start, end, _, details = select_edit(job, Path("fixture.mkv"), 0, 40, words, evidence, 10, 24)
+        self.assertTrue(details["editorial_pass"], details["editorial_reasons"])
+        self.assertTrue(10.5 <= start < 16 < 19 < end <= 22)
+        self.assertGreaterEqual(end-start, 10)
+
+    def test_repair_restores_corroborating_word_cut_off_by_initial_window(self):
+        job = {"creator": "Example", "min_seconds": 10, "max_seconds": 30}
+        evidence = {"peak": 16, "release": 19, "surge": True}
+        words = [
+            {"start": 10.25, "end": 11.5, "text": "Look", "confidence": .96},
+            {"start": 18.9, "end": 20.4, "text": "Wow!", "confidence": .96},
+        ]
+        with patch("media.usable_picture", return_value=True):
+            start, end, _, details = select_edit(job, Path("fixture.mkv"), 0, 40, words, evidence, 10.1, 20.1)
+        self.assertEqual(details["quality_version"], 2)
+        self.assertTrue(details["editorial_pass"], details["editorial_reasons"])
+        self.assertFalse(10.25 < start < 11.5)
+        self.assertGreaterEqual(end, 20.4)
 
     def test_end_prefers_pause_after_reaction(self):
         with tempfile.TemporaryDirectory() as root:
@@ -115,6 +159,40 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(metadata(job, [dict(text="Ah!", start=5.2, end=5.4, confidence=.55)],
                                   5, 6)["quality_version"], 0)
 
+    def test_editorial_gate_separates_reaction_from_pacing_and_picture(self):
+        job = {"creator": "Example"}
+        words = [
+            dict(text=text, start=3+i*.3, end=3.3+i*.3, confidence=.94)
+            for i, text in enumerate(("Did", "you", "see", "that?"))
+        ]
+        passing = metadata(job, words, 3, 7, duration=9)
+        self.assertEqual(passing["quality_version"], 2)
+        self.assertTrue(passing["editorial_pass"])
+        self.assertIn("Did you see that?", passing["opening_hook"])
+        self.assertEqual(passing["reaction_start_seconds"], 3)
+        self.assertEqual(passing["reaction_end_seconds"], 7)
+        bad_picture = metadata(job, words, 3, 7, duration=9, picture_ok=False)
+        self.assertEqual(bad_picture["quality_version"], 2)
+        self.assertFalse(bad_picture["editorial_pass"])
+        long_tail = metadata(job, words, 3, 7, duration=11)
+        self.assertIn("The edit runs too long after the reaction.", long_tail["editorial_reasons"])
+        lone_word = metadata(job, words[:1], 3, 7, duration=9)
+        self.assertIn("No clear opening context.", lone_word["editorial_reasons"])
+
+    def test_unclear_text_is_not_burned_in_and_hook_is_escaped(self):
+        words = [
+            {"start": 0, "end": .4, "text": "[unclear]"},
+            {"start": 2, "end": 2.5, "text": "Hello!"},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root)
+            write_captions(target, words, 4, hook="{Watch!}")
+            self.assertNotIn("[unclear]", (target / "captions.srt").read_text(encoding="utf-8"))
+            ass = (target / "captions.ass").read_text(encoding="utf-8")
+            self.assertNotIn("[unclear]", ass)
+            self.assertIn("Dialogue: 1,0:00:00.00,0:00:01.65,Hook", ass)
+            self.assertIn("｛Watch!｝", ass)
+
     def test_layout_keeps_full_gameplay_in_each_landscape_strategy(self):
         landscape = {"width": 1920, "height": 1080}
         self.assertIn("force_original_aspect_ratio=decrease", safe_layout(landscape))
@@ -122,6 +200,9 @@ class MediaTests(unittest.TestCase):
         self.assertIn("crop=480:240:100:100", camera)
         self.assertIn("force_original_aspect_ratio=decrease", camera)
         self.assertIn("ass=captions.ass", camera)
+        self.assertIsNone(gameplay_crop(landscape, (480, 240, 100, 100)))
+        self.assertEqual(gameplay_crop(landscape, (200, 134, 0, 0)), (1720, 1080, 200, 0))
+        self.assertIn("between(t,2.500,4.000)", safe_layout(landscape, (200, 134, 0, 0), (2.5, 4)))
 
 
 if __name__ == "__main__":

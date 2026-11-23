@@ -4,7 +4,7 @@ use reqwest::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE, RETRY_AFTER},
     Client, Response,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
@@ -24,6 +24,9 @@ pub async fn supervise(db: Database) {
         }
     };
     loop {
+        if let Err(error) = super::cleanup::discard_one(&db) {
+            eprintln!("ClipForge rejected clip cleanup: {error}");
+        }
         if let Err(error) = attempt_one(&db, &client).await {
             eprintln!("ClipForge upload worker: {error}");
         }
@@ -49,29 +52,48 @@ struct Job {
 struct Metadata {
     #[serde(default)]
     quality_version: u32,
+    #[serde(default)]
+    editorial_pass: bool,
     title: String,
     description: String,
 }
 
 enum TransferError {
     Retry(String, Option<u64>),
+    ChannelLimit(u64),
     Stop(String),
+    Rejected(String),
     Uncertain,
     Local(String),
 }
 
-fn next_job(db: &Database) -> rusqlite::Result<Option<Job>> {
-    db.connection()?
+pub(super) fn channel_retry_at(conn: &Connection, channel: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT retry_at FROM youtube_channel_cooldowns WHERE channel_id=?1 AND retry_at>unixepoch()",
+        [channel], |row| row.get(0),
+    ).optional()
+}
+
+fn claim_next_job(db: &Database, channel: &str) -> rusqlite::Result<Option<Job>> {
+    let mut conn = db.connection()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if channel_retry_at(&tx, channel)?.is_some() {
+        return Ok(None);
+    }
+    let job = tx
         .query_row(
             "SELECT p.clip_id,j.output_path,p.upload_session,
         p.channel_id,p.file_size,p.may_have_committed,p.attempts
         FROM publishing_jobs p JOIN clip_jobs j ON j.id=p.clip_id
+        LEFT JOIN clip_review r ON r.clip_id=j.id
         WHERE p.status IN ('queued','retry','uploading')
          AND (p.retry_at IS NULL OR p.retry_at <= unixepoch())
+         AND (p.channel_id IS NULL OR p.channel_id=?1)
+         AND (r.decision IS NULL OR r.decision<>'hold' OR p.may_have_committed=1)
          AND j.status = 'ready' AND j.output_path IS NOT NULL
          AND NOT EXISTS(SELECT 1 FROM uploaded_videos u WHERE u.clip_id=p.clip_id)
-        ORDER BY p.clip_id LIMIT 1",
-            [],
+        ORDER BY p.may_have_committed DESC,p.clip_id LIMIT 1",
+            [channel],
             |row| {
                 Ok(Job {
                     id: row.get(0)?,
@@ -84,7 +106,24 @@ fn next_job(db: &Database) -> rusqlite::Result<Option<Job>> {
                 })
             },
         )
-        .optional()
+        .optional()?;
+    if let Some(job) = &job {
+        tx.execute(
+            "UPDATE publishing_jobs SET status='uploading' WHERE clip_id=?1",
+            [job.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(job)
+}
+
+fn set_channel_cooldown(conn: &Connection, channel: &str, delay: u64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO youtube_channel_cooldowns(channel_id,retry_at) VALUES(?1,unixepoch()+?2)
+        ON CONFLICT(channel_id) DO UPDATE SET retry_at=max(retry_at,excluded.retry_at)",
+        params![channel, delay],
+    )?;
+    Ok(())
 }
 
 async fn attempt_one(db: &Database, client: &Client) -> Result<(), String> {
@@ -94,10 +133,13 @@ async fn attempt_one(db: &Database, client: &Client) -> Result<(), String> {
     let Some(account) = account()? else {
         return Ok(());
     };
-    let Some(mut job) = next_job(db).map_err(|error| error.to_string())? else {
+    let Some(mut job) =
+        claim_next_job(db, &account.channel_id).map_err(|error| error.to_string())?
+    else {
         return Ok(());
     };
     let result = upload(db, client, &account, &mut job).await;
+    let mut channel_delay = None;
     let (state, message, delay) = match result {
         Ok(()) => return Ok(()),
         Err(TransferError::Local(error)) => return Err(error),
@@ -108,19 +150,33 @@ async fn attempt_one(db: &Database, client: &Client) -> Result<(), String> {
             None,
         ),
         Err(TransferError::Stop(error)) => ("failed", error, None),
+        Err(TransferError::Rejected(error)) => ("rejected", error, None),
+        Err(TransferError::ChannelLimit(delay)) => {
+            channel_delay = Some(delay);
+            (
+                "retry",
+                "The channel reached its YouTube upload limit.".into(),
+                Some(delay),
+            )
+        }
         Err(TransferError::Retry(error, delay)) => {
             let delay = delay.unwrap_or_else(|| (15 * 2_u64.pow(job.attempts.min(8))).min(3600));
             ("retry", error, Some(delay.min(86_400)))
         }
     };
     db.connection()
-        .and_then(|connection| {
-            connection.execute(
+        .and_then(|mut connection| {
+            let tx = connection.transaction()?;
+            if let Some(delay) = channel_delay {
+                set_channel_cooldown(&tx, &account.channel_id, delay)?;
+            }
+            tx.execute(
                 "UPDATE publishing_jobs
         SET status=?2,error=?3,retry_at=CASE WHEN ?4 IS NULL THEN NULL ELSE unixepoch()+?4 END,
         attempts=attempts+1 WHERE clip_id=?1",
                 params![job.id, state, message, delay],
-            )
+            )?;
+            tx.commit()
         })
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -181,6 +237,14 @@ async fn upload(
             200 | 201 => return complete(db, job.id, &metadata.title, response).await,
             308 => {
                 offset = received(&response, size)?;
+                if !job.may_have_committed && offset < size {
+                    if let Err(error) = check_upload_policy(db, job.id, &metadata) {
+                        if matches!(error, TransferError::Stop(_) | TransferError::Rejected(_)) {
+                            release_uncommitted_session(db, job.id)?;
+                        }
+                        return Err(error);
+                    }
+                }
                 track(
                     db,
                     job.id,
@@ -191,7 +255,15 @@ async fn upload(
                 uri
             }
             404 | 410 if job.may_have_committed => return Err(Uncertain),
-            404 | 410 => start(db, client, account, job.id, &token, &metadata, size).await?,
+            404 | 410 => match start(db, client, account, job.id, &token, &metadata, size).await {
+                Ok(uri) => uri,
+                Err(error) => {
+                    if matches!(error, TransferError::Stop(_) | TransferError::Rejected(_)) {
+                        release_uncommitted_session(db, job.id)?;
+                    }
+                    return Err(error);
+                }
+            },
             _ => return Err(api_error(response).await),
         }
     } else {
@@ -292,6 +364,77 @@ fn passes_minimum(confidence: Option<f64>, minimum: u32) -> bool {
     confidence.is_some_and(|value| value >= f64::from(minimum.max(80)))
 }
 
+fn passes_editorial(editorial_pass: bool, decision: Option<&str>) -> bool {
+    editorial_pass && decision != Some("hold")
+}
+
+fn check_upload_policy(db: &Database, id: i64, metadata: &Metadata) -> Result<(), TransferError> {
+    let settings = db.settings().map_err(TransferError::Local)?;
+    if !settings.auto_publish {
+        return Err(TransferError::Retry(
+            "Automatic publishing is paused.".into(),
+            Some(300),
+        ));
+    }
+    let (confidence, editorial_pass, decision, editor_version): (Option<f64>, Option<bool>, Option<String>, i64) =
+        db.connection().and_then(|conn| conn.query_row(
+            "SELECT h.confidence,j.editorial_pass,r.decision,j.editor_version FROM clip_jobs j
+             JOIN highlight_events h ON h.id=j.highlight_id LEFT JOIN clip_review r ON r.clip_id=j.id
+             WHERE j.id=?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )).map_err(|err| TransferError::Local(err.to_string()))?;
+    if decision.as_deref() == Some("hold") {
+        return Err(TransferError::Retry(
+            "This clip is held locally.".into(),
+            Some(300),
+        ));
+    }
+    if editorial_pass == Some(false)
+        || (editor_version == 1
+            && editorial_pass.is_some()
+            && confidence.is_some()
+            && !passes_minimum(confidence, settings.minimum_confidence))
+    {
+        return Err(TransferError::Rejected(
+            "The automatic review rejected this clip.".into(),
+        ));
+    }
+    if metadata.quality_version != 2 {
+        return Err(TransferError::Stop(
+            "This clip lacks a current highlight quality assessment.".into(),
+        ));
+    }
+    if !passes_editorial(
+        metadata.editorial_pass && editorial_pass == Some(true),
+        decision.as_deref(),
+    ) {
+        return Err(TransferError::Stop(
+            "This clip lacks a passing editorial assessment.".into(),
+        ));
+    }
+    if !passes_minimum(confidence, settings.minimum_confidence) {
+        return Err(TransferError::Retry(
+            "Waiting for current publishing preferences to allow this clip.".into(),
+            Some(300),
+        ));
+    }
+    Ok(())
+}
+
+fn release_uncommitted_session(db: &Database, id: i64) -> Result<(), TransferError> {
+    db.connection()
+        .and_then(|conn| {
+            conn.execute(
+                "UPDATE publishing_jobs
+         SET upload_session=NULL,uploaded_bytes=0,channel_id=NULL,file_size=NULL
+         WHERE clip_id=?1 AND may_have_committed=0",
+                [id],
+            )
+        })
+        .map_err(|err| TransferError::Local(err.to_string()))?;
+    Ok(())
+}
+
 async fn start(
     db: &Database,
     client: &Client,
@@ -301,22 +444,7 @@ async fn start(
     metadata: &Metadata,
     size: u64,
 ) -> Result<Url, TransferError> {
-    if metadata.quality_version != 2 {
-        return Err(TransferError::Stop(
-            "Held for review: this clip lacks a passing highlight quality check.".into(),
-        ));
-    }
-    let settings = db.settings().map_err(TransferError::Local)?;
-    let confidence: Option<f64> = db.connection().and_then(|conn| conn.query_row(
-        "SELECT h.confidence FROM clip_jobs j JOIN highlight_events h ON h.id=j.highlight_id WHERE j.id=?1",
-        [id], |row| row.get(0),
-    )).map_err(|err| TransferError::Local(err.to_string()))?;
-    if !settings.auto_publish || !passes_minimum(confidence, settings.minimum_confidence) {
-        return Err(TransferError::Retry(
-            "Waiting for current publishing preferences to allow this clip.".into(),
-            Some(300),
-        ));
-    }
+    check_upload_policy(db, id, metadata)?;
     let response = client
         .post("https://www.googleapis.com/upload/youtube/v3/videos")
         .query(&[("part", "snippet,status"), ("uploadType", "resumable")])
@@ -475,10 +603,9 @@ async fn api_error(response: Response) -> TransferError {
         "quotaExceeded" | "dailyLimitExceeded" => {
             TransferError::Retry("YouTube API quota exhausted.".into(), Some(3600))
         }
-        "uploadLimitExceeded" => TransferError::Retry(
-            "The channel reached its YouTube upload limit.".into(),
-            Some(3600),
-        ),
+        "uploadLimitExceeded" => {
+            TransferError::ChannelLimit(delay.unwrap_or(3600).clamp(60, 86_400))
+        }
         "rateLimitExceeded" | "userRateLimitExceeded" => {
             TransferError::Retry("YouTube is rate limiting uploads.".into(), delay)
         }
@@ -518,6 +645,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn previously_approved_clips_still_need_to_pass_automatic_editorial_review() {
+        assert!(passes_editorial(true, None));
+        assert!(!passes_editorial(false, None));
+        assert!(!passes_editorial(true, Some("hold")));
+        assert!(!passes_editorial(false, Some("approved")));
+        assert!(passes_editorial(true, Some("approved")));
+    }
+
+    #[test]
+    fn cooldown_is_channel_wide_persistent_and_respects_held_clips() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("channel-cooldown.db");
+        let db = Database::open(&path).unwrap();
+        let conn = db.connection().unwrap();
+        conn.execute_batch(
+            "INSERT INTO creators(id,username,channel_url) VALUES(1,'test','https://www.twitch.tv/test');
+             INSERT INTO stream_sessions(id,creator_id,started_at) VALUES(1,1,1);
+             INSERT INTO highlight_events(id,session_id,triggered_at,score) VALUES(1,1,1,90),(2,1,2,90);
+             INSERT INTO clip_jobs(id,highlight_id,status,output_path)
+               VALUES(1,1,'ready','short1.mp4'),(2,2,'ready','short2.mp4');
+             INSERT INTO publishing_jobs(clip_id,status) VALUES(1,'queued'),(2,'queued');
+             INSERT INTO clip_review(clip_id,decision) VALUES(1,'hold');"
+        ).unwrap();
+        set_channel_cooldown(&conn, "limited", 3600).unwrap();
+        let first = channel_retry_at(&conn, "limited").unwrap().unwrap();
+        set_channel_cooldown(&conn, "limited", 60).unwrap();
+        assert_eq!(channel_retry_at(&conn, "limited").unwrap(), Some(first));
+        drop(conn);
+        let reopened = Database::open(&path).unwrap();
+        assert!(claim_next_job(&reopened, "limited").unwrap().is_none());
+
+        let job = claim_next_job(&reopened, "other").unwrap().unwrap();
+        assert_eq!(job.id, 2);
+        let conn = reopened.connection().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM publishing_jobs WHERE clip_id=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "uploading");
+        conn.execute(
+            "UPDATE youtube_channel_cooldowns SET retry_at=unixepoch()-1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(claim_next_job(&reopened, "limited").unwrap().unwrap().id, 2);
+    }
+
+    #[test]
+    fn releasing_a_legacy_session_preserves_the_final_chunk_fence() {
+        let folder = tempfile::tempdir().unwrap();
+        let db = Database::open(folder.path().join("legacy-resume.db")).unwrap();
+        let conn = db.connection().unwrap();
+        conn.execute_batch(
+            "INSERT INTO creators(id,username,channel_url) VALUES(1,'test','https://www.twitch.tv/test');
+             INSERT INTO stream_sessions(id,creator_id,started_at) VALUES(1,1,1);
+             INSERT INTO highlight_events(id,session_id,triggered_at,score,confidence)
+               VALUES(1,1,1,95,95),(2,1,2,95,95);
+             INSERT INTO clip_jobs(id,highlight_id,status,output_path)
+               VALUES(1,1,'ready','short1.mp4'),(2,2,'ready','short2.mp4');
+             INSERT INTO publishing_jobs(clip_id,status,upload_session,may_have_committed)
+               VALUES(1,'uploading','uncommitted',0),(2,'uploading','possibly-committed',1);"
+        ).unwrap();
+        let legacy = Metadata {
+            quality_version: 2,
+            editorial_pass: false,
+            title: "Test".into(),
+            description: String::new(),
+        };
+        let mut settings = db.settings().unwrap();
+        settings.auto_publish = true;
+        db.save_settings(&settings).unwrap();
+        assert!(matches!(
+            check_upload_policy(&db, 1, &legacy),
+            Err(TransferError::Stop(_))
+        ));
+        release_uncommitted_session(&db, 1)
+            .map_err(|_| "failed to release")
+            .unwrap();
+        release_uncommitted_session(&db, 2)
+            .map_err(|_| "failed to preserve fence")
+            .unwrap();
+        let uri = |id: i64| {
+            conn.query_row(
+                "SELECT upload_session FROM publishing_jobs WHERE clip_id=?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        assert!(uri(1).is_none());
+        assert_eq!(uri(2).as_deref(), Some("possibly-committed"));
+    }
+
     #[tokio::test]
     async fn persists_final_chunk_fence_and_records_success_once() {
         use tokio::io::AsyncWriteExt;
@@ -541,7 +765,7 @@ mod tests {
         .map_err(|_| "cannot persist fence")
         .unwrap();
         let reopened = Database::open(&path).unwrap();
-        let job = next_job(&reopened).unwrap().unwrap();
+        let job = claim_next_job(&reopened, "test").unwrap().unwrap();
         assert!(job.may_have_committed);
         assert!(job.uri.unwrap().contains("upload_id=test"));
         for _ in 0..2 {
@@ -572,7 +796,7 @@ mod tests {
                 .unwrap();
             mock.await.unwrap();
         }
-        assert!(next_job(&reopened).unwrap().is_none());
+        assert!(claim_next_job(&reopened, "test").unwrap().is_none());
         let count: i64 = reopened
             .connection()
             .unwrap()

@@ -3,6 +3,7 @@ mod db;
 mod model;
 mod production;
 mod recording;
+mod review;
 mod runtime;
 mod twitch;
 mod youtube;
@@ -126,6 +127,7 @@ pub fn run() {
             }
             app.manage(twitch::Twitch::new()?);
             app.manage(production::ModelSetup::default());
+            app.manage(production::RenderSlot::default());
             app.manage(youtube::YouTube::default());
             tauri::async_runtime::spawn(youtube::supervise(database.clone()));
             let app_handle = app.handle().clone();
@@ -192,6 +194,10 @@ pub fn run() {
             save_settings,
             show_clip,
             clip_thumbnail,
+            review::preview_clip,
+            review::set_clip_review,
+            review::trim_clip,
+            production::reedit_clip,
             twitch::twitch_status,
             twitch::twitch_begin,
             twitch::twitch_finish,

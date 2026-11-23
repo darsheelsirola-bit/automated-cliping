@@ -52,6 +52,12 @@ export type Clip = {
   videoId: string | null;
   title: string | null;
   publishedAt: number | null;
+  reviewDecision: "hold" | "approved" | null;
+  editorialPass: boolean | null;
+  editorialNotes: string | null;
+  retryAt: number | null;
+  reviewLocked: boolean;
+  canReedit: boolean;
 };
 
 export type ErrorEntry = {
@@ -84,6 +90,10 @@ export const api = {
   setCreatorEnabled: (id: number, enabled: boolean) => invoke<void>("set_creator_enabled", { id, enabled }),
   removeCreator: (id: number) => invoke<void>("remove_creator", { id }),
   showClip: (id: number) => invoke<void>("show_clip", { id }),
+  reeditClip: (id: number) => invoke<void>("reedit_clip", { id }),
+  previewClip: (id: number) => invoke<string>("preview_clip", { id }),
+  setClipReview: (id: number, approved: boolean) => invoke<void>("set_clip_review", { id, approved }),
+  trimClip: (id: number, startMs: number, endMs: number) => invoke<void>("trim_clip", { id, startMs, endMs }),
   clipThumbnail: (id: number) => invoke<string | null>("clip_thumbnail", { id }),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
 };
@@ -98,7 +108,7 @@ export const twitchApi = {
 };
 
 
-export type YouTubeStatus = { connected: boolean; channelTitle: string | null };
+export type YouTubeStatus = { connected: boolean; channelTitle: string | null; uploadRetryAt: number | null };
 
 export const productionApi = {
   modelReady: () => invoke<boolean>("model_ready"),

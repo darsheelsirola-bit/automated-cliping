@@ -223,6 +223,9 @@ struct Output {
     metadata: serde_json::Value,
 }
 
+#[derive(Default)]
+pub(crate) struct RenderSlot(pub tokio::sync::Mutex<()>);
+
 pub async fn supervise(app: AppHandle, db: Database) {
     loop {
         if let Err(error) = crate::recording::prune_expired(&db) {
@@ -277,6 +280,8 @@ async fn process_one(app: &AppHandle, db: &Database) -> Result<(), String> {
         )?;
         return Ok(());
     };
+    let slot = app.state::<RenderSlot>();
+    let _render = slot.0.lock().await;
     let (folder, already_saved) =
         work_folder(db, clip_id, PathBuf::from(settings.storage_directory))
             .map_err(|error| error.to_string())?;
@@ -375,13 +380,23 @@ fn reconcile_saved_sizes(db: &Database) -> Result<(), String> {
                 Err(error) => Err(error.to_string()),
             }
         };
-        let actual =
-            size(path(master, "source.mkv"))?.saturating_add(size(path(export, "short.mp4"))?);
+        let local_export = path(export.clone(), "short.mp4");
+        let retained = |file: &str| local_export.as_ref().filter(|path| {
+            path.file_name().is_some_and(|name| name != file && matches!(name.to_str(), Some("short-reviewed.mp4" | "short-reedited.mp4")))
+        }).map(|path| path.with_file_name(file));
+        let originals = size(retained("short.mp4"))?.saturating_add(
+            if local_export.as_ref().is_some_and(|path| path.ends_with("short-reedited.mp4")) {
+                size(retained("short-reviewed.mp4"))?
+            } else { 0 }
+        );
+        let actual = size(path(master, "source.mkv"))?
+            .saturating_add(size(local_export)?)
+            .saturating_add(originals);
         if prior != actual {
             connection
                 .execute(
-                    "UPDATE clip_jobs SET saved_bytes=?2 WHERE id=?1",
-                    params![id, actual],
+                    "UPDATE clip_jobs SET saved_bytes=?2 WHERE id=?1 AND saved_bytes=?3 AND output_path IS ?4",
+                    params![id, actual, prior, export],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -570,16 +585,24 @@ async fn produce(
     let start = start + result.start_offset_ms;
     let corroborated = result.metadata["quality_version"].as_u64() == Some(2);
     let confidence = publication_confidence(highlight.score, result.reaction_strength, corroborated);
+    let editorial_pass = result.metadata["editorial_pass"].as_bool().unwrap_or(false);
+    let editorial_notes = result.metadata["editorial_reasons"].as_array()
+        .map(|items| items.iter().filter_map(|item| item.as_str()).collect::<Vec<_>>().join(" · "))
+        .unwrap_or_default();
+    let metadata = serde_json::to_vec(&result.metadata).map_err(|error| error.to_string())?;
+    std::fs::write(job.folder.join("metadata.json"), metadata).map_err(|error| error.to_string())?;
     tx.execute(
         "UPDATE clip_jobs SET status='ready', source_path=?2,output_path=?3,
-        thumbnail_path=?4,duration_ms=?5,saved_bytes=?6,updated_at=unixepoch() WHERE id=?1",
+        thumbnail_path=?4,duration_ms=?5,saved_bytes=?6,editorial_pass=?7,editorial_notes=?8,editor_version=1,updated_at=unixepoch() WHERE id=?1",
         params![
             job.clip_id,
             source,
             short,
             thumbnail,
             result.duration_ms,
-            result.saved_bytes
+            result.saved_bytes,
+            editorial_pass,
+            editorial_notes,
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -603,14 +626,124 @@ async fn produce(
         params![job.clip_id, short],
     )
     .map_err(|error| error.to_string())?;
-    if confidence >= f64::from(minimum.max(80)) && corroborated {
+    if confidence >= f64::from(minimum.max(80)) && corroborated && editorial_pass {
         tx.execute("INSERT INTO publishing_jobs(clip_id,status) VALUES(?1,'queued') ON CONFLICT DO NOTHING", [job.clip_id])
-            .map_err(|error| error.to_string())?;
-        let metadata = serde_json::to_vec(&result.metadata).map_err(|error| error.to_string())?;
-        std::fs::write(job.folder.join("metadata.json"), metadata)
             .map_err(|error| error.to_string())?;
     }
     tx.commit().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn reedit_clip(
+    app: AppHandle,
+    database: tauri::State<'_, Database>,
+    id: i64,
+) -> Result<(), String> {
+    let db = database.inner().clone();
+    let slot = app.state::<RenderSlot>();
+    let _render = slot.0.try_lock().map_err(|_| "A reel is already rendering. Try again once it finishes.")?;
+    let runtime = runtime(&app)?;
+    let script = script_path(&app)?;
+    let cache = model_cache(&app)?;
+    if !model_files_available(&cache) {
+        return Err("Install the transcription model in Settings before re-editing.".into());
+    }
+    let error = |err: rusqlite::Error| err.to_string();
+    let query = format!(
+        "SELECT j.output_path,j.work_dir,j.source_path,h.id,h.score FROM clip_jobs j
+        JOIN highlight_events h ON h.id=j.highlight_id WHERE {} AND j.editor_version=0",
+        crate::review::MUTABLE_REEL
+    );
+    let (output, folder, source, highlight, live_score): (String, String, String, i64, f64) =
+        db.connection().map_err(error)?.query_row(&query, [id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        }).map_err(|_| "This local reel is unavailable for re-editing.")?;
+    crate::review::export_path(id, &output, &folder)?;
+    let folder = PathBuf::from(folder);
+    let target = folder.join("short-reedited.mp4");
+    if Path::new(&output) == target {
+        return Err("This reel already uses the new editor.".into());
+    }
+    let source = PathBuf::from(source);
+    if source != folder.join("source.mkv") || !std::fs::symlink_metadata(&source)
+        .map_err(|_| "The original recording is unavailable.")?.file_type().is_file() {
+        return Err("The original recording is unavailable.".into());
+    }
+    let mut job: serde_json::Value = serde_json::from_slice(&std::fs::read(folder.join("job.json"))
+        .map_err(|_| "This reel has no saved edit request.")?).map_err(|err| err.to_string())?;
+    let staging = tempfile::Builder::new().prefix(".reedit-").tempdir_in(&folder)
+        .map_err(|err| err.to_string())?;
+    std::fs::hard_link(&source, staging.path().join("source.mkv"))
+        .map_err(|err| format!("Could not stage the original recording. {err}"))?;
+    let budget = (db.settings()?.saved_budget_gb * 1_000_000_000.0) as i64;
+    let source_size = std::fs::metadata(&source).map_err(|err| err.to_string())?.len() as i64;
+    let available = budget.saturating_sub(saved_bytes(&db).map_err(error)?);
+    if available <= 0 {
+        return Err("There is no space for a revised reel within your clip storage limit.".into());
+    }
+    job["model_cache"] = serde_json::json!(cache);
+    job["folder"] = serde_json::json!(staging.path());
+    job["remaining_saved_bytes"] = serde_json::json!(available.saturating_add(source_size));
+    job["segments"] = serde_json::json!([]);
+    let request = staging.path().join("job.json");
+    std::fs::write(&request, serde_json::to_vec(&job).map_err(|err| err.to_string())?)
+        .map_err(|err| err.to_string())?;
+    crate::review::set_clip_review(database, id, false)?;
+
+    run_worker(&runtime, &script, "produce", &request, &staging.path().join("processing.log"), 7200).await?;
+    let result_bytes = std::fs::read(staging.path().join("result.json")).map_err(|err| err.to_string())?;
+    let result: Output = serde_json::from_slice(&result_bytes).map_err(|err| err.to_string())?;
+    if !contains_selected_event(&result, 20_000) {
+        return Err("The re-edit could not retain the selected reaction.".into());
+    }
+    let candidate = staging.path().join("short.mp4");
+    let bytes = std::fs::metadata(&candidate).map_err(|err| err.to_string())?.len() as i64;
+    let corroborated = result.metadata["quality_version"].as_u64() == Some(2);
+    let confidence = publication_confidence(live_score, result.reaction_strength, corroborated);
+    let editorial_pass = result.metadata["editorial_pass"].as_bool().unwrap_or(false);
+    let mut conn = db.connection().map_err(error)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(error)?;
+    let current: String = tx.query_row(&format!(
+        "SELECT j.output_path FROM clip_jobs j JOIN clip_review r ON r.clip_id=j.id
+        WHERE {} AND r.decision='hold'", crate::review::MUTABLE_REEL), [id], |row| row.get(0))
+        .map_err(|_| "This reel changed while the re-edit was rendering.")?;
+    if current != output {
+        return Err("This reel changed while the re-edit was rendering.".into());
+    }
+    let used: i64 = tx.query_row("SELECT coalesce(sum(saved_bytes),0) FROM clip_jobs", [], |row| row.get(0)).map_err(error)?;
+    let budget = (db.settings_with(&tx)?.saved_budget_gb * 1_000_000_000.0) as i64;
+    if used.saturating_add(bytes) > budget {
+        return Err("The re-edit would exceed your saved clip storage limit.".into());
+    }
+
+    let metadata_path = crate::youtube::metadata_path(&target)?;
+    std::fs::write(metadata_path, serde_json::to_vec(&result.metadata).map_err(|err| err.to_string())?)
+        .map_err(|err| err.to_string())?;
+    // A failed commit leaves the original assets selected. Only verified staged assets become active.
+    let promote = |input: &str, output: &str| -> Result<PathBuf, String> {
+        let path = folder.join(output);
+        std::fs::rename(staging.path().join(input), &path).map_err(|err| err.to_string())?;
+        Ok(path)
+    };
+    let thumbnail = promote("thumbnail.jpg", "thumbnail-reedited.jpg")?;
+    let transcript = promote("transcript.json", "transcript-reedited.json")?;
+    let srt = promote("captions.srt", "captions-reedited.srt")?;
+    let ass = promote("captions.ass", "captions-reedited.ass")?;
+    std::fs::rename(candidate, &target).map_err(|err| err.to_string())?;
+    let notes = result.metadata["editorial_reasons"].as_array()
+        .map(|items| items.iter().filter_map(|item| item.as_str()).collect::<Vec<_>>().join(" · "));
+    tx.execute("UPDATE clip_jobs SET output_path=?2,duration_ms=?3,saved_bytes=saved_bytes+?4,
+        editorial_pass=?5,editorial_notes=?6,thumbnail_path=?7,editor_version=1,updated_at=unixepoch() WHERE id=?1",
+        params![id, target.to_string_lossy(), result.duration_ms, bytes, editorial_pass, notes, thumbnail.to_string_lossy()]).map_err(error)?;
+    tx.execute("UPDATE transcription_jobs SET transcript_path=?2,srt_path=?3,ass_path=?4 WHERE clip_id=?1",
+        params![id, transcript.to_string_lossy(), srt.to_string_lossy(), ass.to_string_lossy()]).map_err(error)?;
+    tx.execute("UPDATE render_jobs SET output_path=?2 WHERE clip_id=?1",
+        params![id, target.to_string_lossy()]).map_err(error)?;
+    tx.execute("UPDATE highlight_events SET confidence=?2,
+        starts_at=(triggered_at_ms-20000+?3)/1000,
+        ends_at=(triggered_at_ms-20000+?3+?4)/1000 WHERE id=?1",
+        params![highlight, confidence, result.start_offset_ms, result.duration_ms]).map_err(error)?;
+    tx.commit().map_err(error)
 }
 
 fn contains_selected_event(result: &Output, trigger: i64) -> bool {
@@ -757,5 +890,13 @@ mod tests {
         std::fs::remove_file(master).unwrap();
         reconcile_saved_sizes(&db).unwrap();
         assert_eq!(saved_bytes(&db).unwrap(), 0);
+        let original = work.join("short.mp4");
+        let trimmed = work.join("short-reviewed.mp4");
+        std::fs::write(original, b"original").unwrap();
+        std::fs::write(&trimmed, b"trim").unwrap();
+        connection.execute("UPDATE clip_jobs SET output_path=?2 WHERE id=?1",
+            params![id, trimmed.to_string_lossy()]).unwrap();
+        reconcile_saved_sizes(&db).unwrap();
+        assert_eq!(saved_bytes(&db).unwrap(), 12);
     }
 }

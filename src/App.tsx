@@ -1,3 +1,4 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, productionApi, twitchApi, type ChatActivity, type Clip, type Creator, type Dashboard, type TwitchStatus } from "./api";
@@ -133,9 +134,9 @@ function App() {
             navigate={setPage} add={() => setShowAdd(true)} toggleMonitoring={toggleMonitoring} />}
           {page === "Creators" && <CreatorTable creators={data.creators} busy={busy} run={run} onAdd={() => setShowAdd(true)} />}
           {page === "Live Monitor" && <LiveMonitor data={data} />}
-          {page === "Clip Library" && <ClipTable clips={data.clips.filter((clip) => clip.outputPath)} mode="library" />}
+          {page === "Clip Library" && <ClipTable clips={data.clips.filter((clip) => clip.outputPath)} mode="library" automatic={data.settings.autoPublish} />}
           {page === "Processing Queue" && <ClipTable clips={data.clips} mode="queue" />}
-          {page === "Publishing History" && <ClipTable clips={data.clips.filter((clip) => clip.publishingStatus || clip.videoId)} mode="publishing" />}
+          {page === "Publishing History" && <ClipTable clips={data.clips.filter((clip) => clip.publishingStatus || clip.videoId || clip.status === "discarded" || clip.status === "discarding")} mode="publishing" automatic={data.settings.autoPublish} />}
           {page === "Analytics" && <Analytics data={data} />}
           {page === "Settings" && <Preferences data={data} twitch={twitch} busy={busy} run={run} />}
         </>}
@@ -286,21 +287,43 @@ const clipViews = {
   publishing: { title: "Upload records", empty: "No upload attempts", detail: "YouTube upload results and errors will appear here.", icon: "publishing" },
 } as const;
 
-function ClipTable({ clips, mode }: { clips: Clip[]; mode: keyof typeof clipViews }) {
+function ClipTable({ clips, mode, automatic = false }: { clips: Clip[]; mode: keyof typeof clipViews; automatic?: boolean }) {
   const view = clipViews[mode];
   const [error, setError] = useState("");
+  const [previewId, setPreviewId] = useState<number | null>(null);
+  const [cooldown, setCooldown] = useState<number | null>(null);
+  useEffect(() => {
+    if (mode !== "publishing") return;
+    let mounted = true;
+    const refresh = () => void productionApi.youtubeStatus().then(
+      (status) => { if (mounted) setCooldown(status.uploadRetryAt); }, () => {},
+    );
+    refresh();
+    const timer = window.setInterval(refresh, 15_000);
+    return () => { mounted = false; window.clearInterval(timer); };
+  }, [mode]);
+  const preview = clips.find((clip) => clip.id === previewId);
   return <Panel title={view.title}>
+    {mode === "publishing" && cooldown && cooldown * 1000 > Date.now() ? (
+      <p className="notice">Channel upload limit. Automatic uploads resume after <Stamp value={cooldown} />.</p>
+    ) : null}
+    {preview && <ReelReview key={preview.id} clip={preview} automatic={automatic} close={() => setPreviewId(null)} />}
     {error && <p className="notice" role="alert">{error}</p>}
     {clips.length ? <div className="table-scroll"><table>
       <thead><tr><th>Clip</th><th>Creator</th><th>Status</th><th>{mode === "library" ? "Duration" : mode === "queue" ? "Stages" : "YouTube"}</th><th>Created</th></tr></thead>
       <tbody>{clips.map((clip) => <tr key={clip.id}>
-        <th scope="row">{mode === "library" && clip.thumbnailPath && <Thumbnail id={clip.id} />}
+        <th scope="row">{mode === "library" && clip.thumbnailPath && <Thumbnail key={clip.thumbnailPath} id={clip.id} />}
           {clip.title ?? `Clip ${clip.id}`}
+          {mode === "library" && clip.outputPath && <>
+            <button type="button" className="text-link clip-file" onClick={() => setPreviewId(clip.id)}>{automatic ? "Preview" : "Preview & review"}</button>
+            {!automatic && clip.reviewDecision && <span className="cell-note">{clip.reviewDecision === "hold" ? "Held for review" : "Approved"}</span>}
+          </>}
+          {mode === "publishing" && clip.retryAt && clip.retryAt * 1000 > Date.now() ? <span className="cell-note">Retry after <Stamp value={clip.retryAt} /></span> : null}
           {(clip.error || clip.publishingError) && <span className="cell-note">{clip.error ?? clip.publishingError}</span>}
           {mode === "library" && clip.outputPath && <button type="button" className="text-link clip-file"
             onClick={() => void api.showClip(clip.id).catch((reason: unknown) => setError(String(reason)))}>Show in File Explorer <Icon name="external" size={13} /></button>}
         </th>
-        <td>{clip.username}</td><td><Status value={mode === "publishing" ? clip.publishingStatus ?? "published" : clip.status} /></td>
+        <td>{clip.username}</td><td><Status value={mode === "publishing" && !["discarding", "discarded"].includes(clip.status) ? clip.publishingStatus ?? clip.status : clip.status} /></td>
         <td>{mode === "library" ? (clip.durationMs === null ? "—" : `${Math.round(clip.durationMs / 1000)} s`) :
           mode === "queue" ? [clip.transcriptionStatus && `Transcription ${clip.transcriptionStatus}`, clip.renderStatus && `Render ${clip.renderStatus}`, clip.publishingStatus && `Upload ${clip.publishingStatus}`].filter(Boolean).join(" · ") || "—" :
           clip.videoId ? <button type="button" className="text-link" onClick={() => void openUrl(`https://youtu.be/${encodeURIComponent(clip.videoId!)}`).catch((reason: unknown) => setError(String(reason)))}>Watch <Icon name="external" size={14} /></button> :
@@ -309,6 +332,73 @@ function ClipTable({ clips, mode }: { clips: Clip[]; mode: keyof typeof clipView
       </tr>)}</tbody>
     </table></div> : <Empty icon={view.icon} title={view.empty}>{view.detail}</Empty>}
   </Panel>;
+}
+
+function ReelReview({ clip, close, automatic }: { clip: Clip; close: () => void; automatic: boolean }) {
+  const video = useRef<HTMLVideoElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [source, setSource] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const duration = (clip.durationMs ?? 0) / 1000;
+  const [start, setStart] = useState(0);
+  const [end, setEnd] = useState(duration);
+
+  useEffect(() => { dialog.current?.showModal(); }, []);
+  useEffect(() => {
+    let active = true;
+    setSource("");
+    setStart(0);
+    setEnd(duration);
+    void api.previewClip(clip.id).then(
+      (path) => { if (active) setSource(convertFileSrc(path)); },
+      (reason: unknown) => { if (active) setError(String(reason)); },
+    );
+    return () => { active = false; };
+  }, [clip.id, clip.outputPath, duration]);
+
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true);
+    setError("");
+    try { await action(); }
+    catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
+  };
+  const held = clip.reviewDecision === "hold";
+  const originalExport = /[\\/]short\.mp4$/i.test(clip.outputPath ?? "");
+  const reedited = /[\\/]short-reedited\.mp4$/i.test(clip.outputPath ?? "");
+  const rangeValid = start >= 0 && end <= duration && end - start >= 1;
+  return <dialog ref={dialog} className="reel-review" onCancel={(event) => { event.preventDefault(); close(); }}>
+    <div className="panel-heading"><h2>{automatic ? "Preview clip" : "Review clip"} {clip.id}</h2><button type="button" onClick={close}>Close</button></div>
+    {source && <video ref={video} controls playsInline src={source}
+      onError={() => setError("ClipForge could not play this export.")}
+      onTimeUpdate={() => { if (video.current && video.current.currentTime >= end && end < duration) video.current.pause(); }} />}
+    {error && <p className="notice" role="alert">{error}</p>}
+    {!automatic && !clip.reviewLocked && <div className="review-controls">
+      <div className="form-actions">
+        <button type="button" disabled={busy || held} onClick={() => void run(() => api.setClipReview(clip.id, false))}>Hold</button>
+        <button type="button" disabled={busy || clip.reviewDecision === "approved"}
+          onClick={() => void run(() => api.setClipReview(clip.id, true))}>Approve for publishing</button>
+      </div>
+      {clip.canReedit && !reedited && <div className="form-actions">
+        <button type="button" disabled={busy} onClick={() => void run(() => api.reeditClip(clip.id))}>Re-edit with new captions</button>
+      </div>}
+      {busy && <p role="status">Working on this reel…</p>}
+      {held && originalExport && <>
+        <div className="review-trim">
+          <label>Start (seconds)<input type="number" min={0} max={duration} step={0.1} value={start} onChange={(event) => setStart(Number(event.target.value))} /></label>
+          <label>End (seconds)<input type="number" min={0} max={duration} step={0.1} value={end} onChange={(event) => setEnd(Number(event.target.value))} /></label>
+        </div>
+        <div className="form-actions">
+          <button type="button" disabled={!source || !rangeValid} onClick={() => {
+            if (video.current) { video.current.currentTime = start; void video.current.play().catch((reason: unknown) => setError(String(reason))); }
+          }}>Play range</button>
+          <button type="button" disabled={busy || !rangeValid || (start === 0 && end === duration)}
+            onClick={() => void run(() => api.trimClip(clip.id, Math.round(start * 1000), Math.round(end * 1000)))}>Save trim</button>
+        </div>
+      </>}
+    </div>}
+  </dialog>;
 }
 
 function Thumbnail({ id }: { id: number }) {

@@ -69,7 +69,8 @@ export function Preferences({ data, twitch, busy, run }: { data: Dashboard; twit
           </div>
           <label>Highlight threshold (chat and audio reactions)<input type="number" min="0" max="100" value={Number.isNaN(draft.detectionThreshold) ? "" : draft.detectionThreshold} onChange={(event) => setDraft({ ...draft, detectionThreshold: event.target.valueAsNumber })} required /></label>
           <label>Minimum publishing confidence (effective minimum 80)<input type="number" min="0" max="100" value={Number.isNaN(draft.minimumConfidence) ? "" : draft.minimumConfidence} onChange={(event) => setDraft({ ...draft, minimumConfidence: event.target.valueAsNumber })} required /></label>
-          <label className="checkbox"><input type="checkbox" checked={draft.autoPublish} onChange={(event) => setDraft({ ...draft, autoPublish: event.target.checked })} />Automatically publish eligible clips and remove local files after confirmed public publication</label>
+          <label className="checkbox"><input type="checkbox" checked={draft.autoPublish} onChange={(event) => setDraft({ ...draft, autoPublish: event.target.checked })} />Automatically review and publish Shorts</label>
+          <p>ClipForge adds captions and hashtags, then removes local files once it rejects a clip or confirms publication.</p>
         </div>
       </section>
       <section className="panel">

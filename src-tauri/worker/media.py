@@ -48,6 +48,8 @@ def validate_video(path, expected=None):
     if video is None or audio is None or not math.isfinite(duration) or duration < 1:
         raise RuntimeError("Video failed validation. An intact audio and video track is required.")
     if expected is not None:
+        if duration > 180:
+            raise RuntimeError("A YouTube Short cannot exceed 180 seconds.")
         if (video["width"], video["height"], video["codec_name"], audio["codec_name"]) != (1080, 1920, "h264", "aac"):
             raise RuntimeError("Rendered file has incorrect resolution or codecs.")
         if abs(duration - expected) > 0.5:
@@ -181,7 +183,12 @@ def choose_window(audio_path, lead, minimum, maximum, words=(), *, evidence=None
             break
 
     if strength:
-        end_goal = min(available, release + 0.75)
+        # Distribute required duration around setup and payoff and avoid a long ending.
+        start_goal = max(0, lead - min(2, maximum * 0.4))
+        end_goal = min(available, release + 0.65)
+        extra = max(0, minimum - (end_goal - start_goal))
+        end_goal = min(available, end_goal + min(extra * 0.42, 2.10))
+        start_goal = max(0, min(start_goal, end_goal - minimum))
 
     edges = {0.0, available, start_goal, end_goal, *(i / 4 for i in range(len(levels)))}
     phrase_starts, phrase_ends = set(), set()
@@ -200,7 +207,10 @@ def choose_window(audio_path, lead, minimum, maximum, words=(), *, evidence=None
     def cost(t, goal, phrases):
         cuts_word = any(w["start"] + 0.001 < t < w["end"] - 0.001 for w in words)
         loud = levels[min(len(levels)-1, int(t * 4))] > quiet
-        return abs(t - goal) + 50 * cuts_word + 1.5 * loud - 3 * (t in phrases)
+        distance = abs(t - goal)
+        if strength and phrases is phrase_ends and t > goal:
+            distance *= 3
+        return distance + 50 * cuts_word + 1.5 * loud - 3 * (t in phrases)
     # Include exact duration-bound pivots for short, fractional or fixed-length captures.
     edges.update(t - minimum for t in list(edges) if t >= minimum)
     starts = [(t, cost(t, start_goal, phrase_starts)) for t in edges if 0 <= t <= lead - min(1, maximum/4)]
@@ -228,45 +238,96 @@ def timestamp(seconds, ass=False):
     return f"{hours:02}:{minutes:02}:{whole:02},{fraction:03}"
 
 
-def caption_groups(words, duration):
+def caption_lines(words, duration):
+    """Group recognisable words into short, stable lines with non-overlapping timings."""
     current = []
+    usable = []
     for word in words:
-        start = word["start"]
+        start = max(0, word["start"])
         end = min(duration, word["end"])
         text = word["text"].strip()
-        if not (0 <= start < end <= duration) or not text:
+        if 0 <= start < end <= duration and text and text != "[unclear]":
+            usable.append((start, end, text))
+    usable.sort(key=lambda item: item[0])
+    for index, (start, end, text) in enumerate(usable):
+        if index + 1 < len(usable):
+            end = min(end, usable[index + 1][0])
+        if round(start * 100) >= round(end * 100):
             continue
         if current and (len(current) == 5 or start - current[-1][1] > 0.55
                         or sum(len(item[2]) + 1 for item in current) + len(text) > 32
                         or end - current[0][0] > 2.7):
-            yield current[0][0], min(start, current[-1][1]), " ".join(item[2] for item in current)
+            yield current
             current = []
         current.append((start, end, text))
         if re.search(r"[.!?]$", text) and len(current) >= 2:
-            yield current[0][0], current[-1][1], " ".join(item[2] for item in current)
+            yield current
             current = []
     if current:
-        yield current[0][0], current[-1][1], " ".join(item[2] for item in current)
+        yield current
 
 
-def write_captions(folder, words, duration):
-    groups = [(start, end, text) for start, end, text in caption_groups(words, duration)
-              if round(end * 100) > round(start * 100)]
-    for index, (start, _, _) in enumerate(groups[1:], start=1):
-        if start < groups[index - 1][1]:
-            raise RuntimeError("Whisper produced overlapping subtitle groups.")
+def caption_groups(words, duration):
+    for line in caption_lines(words, duration):
+        yield line[0][0], line[-1][1], " ".join(word[2] for word in line)
+
+
+def write_captions(folder, words, duration, hook=""):
+    from unicodedata import east_asian_width
+
     srt = []
     ass = [
         "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1080", "PlayResY: 1920",
         "", "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        "Style: Default,Arial,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H60000000,-1,0,0,0,100,100,0,0,1,5,2,2,108,195,545,1",
+        "Style: Default,Arial,76,&H00FFFFFF,&H00FFFFFF,&H00000000,&H60000000,-1,0,0,0,100,100,0,0,1,7,3,2,100,222,652,1",
+        "Style: Hook,Arial,76,&H00FFFFFF,&H00FFFFFF,&H00000000,&H88100808,-1,0,0,0,100,100,0,0,3,10,0,2,105,185,315,1",
         "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
     ]
-    for index, (start, end, text) in enumerate(groups, start=1):
-        srt.extend((str(index), f"{timestamp(start)} --> {timestamp(end)}", text, ""))
-        safe = text.translate(str.maketrans({"\\": "＼", "{": "｛", "}": "｝"}))
-        ass.append(f"Dialogue: 0,{timestamp(start, True)},{timestamp(end, True)},Default,,0,0,0,,{safe}")
+
+    def ass_text(text):
+        return text.translate(str.maketrans({chr(92): "＼", "{": "｛", "}": "｝", "\n": " ", "\r": " "}))
+
+    def width_units(text):
+        return sum(1.05 if east_asian_width(char) in ("F", "W") else
+                   .93 if char.isupper() or char.lower() in "mw" else
+                   .29 if char in " ilI.,'’!:|" else .68 for char in text)
+
+    def emit(start, end, parts, size, line_break, active=None):
+        if round(start * 100) >= round(end * 100):
+            return
+        tokens = [
+            r"{\1c&H00E8FF&}" + token + r"{\1c&HFFFFFF&}" if index == active else token
+            for index, token in enumerate(parts)
+        ]
+        tags = r"{\q2\fs" + str(size) + "}"
+        rendered = " ".join(tokens) if line_break is None else (
+            " ".join(tokens[:line_break]) + chr(92) + "N" + " ".join(tokens[line_break:])
+        )
+        ass.append(f"Dialogue: 0,{timestamp(start, True)},{timestamp(end, True)},Default,,0,0,0,,{tags}{rendered}")
+
+    if hook:
+        ass.append(f"Dialogue: 1,0:00:00.00,{timestamp(min(1.65, duration), True)},Hook,,0,0,0,,{ass_text(hook)}")
+    for index, line in enumerate(caption_lines(words, duration), start=1):
+        parts = [ass_text(word[2]) for word in line]
+        text = " ".join(parts)
+        # Reserve the right side for the Shorts controls, including generous outline padding.
+        units = width_units(text)
+        line_break = None
+        if len(parts) > 1 and units * 66 > 700:
+            widths = [
+                (max(width_units(" ".join(parts[:index])), width_units(" ".join(parts[index:]))), index)
+                for index in range(1, len(parts))
+            ]
+            units, line_break = min(widths)
+        size = max(1, min(76, int(700 / max(1, units))))
+        srt.extend((str(index), f"{timestamp(line[0][0])} --> {timestamp(line[-1][1])}",
+                    " ".join(word[2] for word in line), ""))
+        cursor = line[0][0]
+        for active, (start, end, _) in enumerate(line):
+            emit(cursor, start, parts, size, line_break)
+            emit(start, end, parts, size, line_break, active)
+            cursor = end
     (folder / "captions.srt").write_text("\n".join(srt), encoding="utf-8")
     (folder / "captions.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
 
@@ -384,23 +445,40 @@ def find_facecam(path, offset, duration, video):
     return crop_width, crop_height, x, y
 
 
-def safe_layout(video, facecam=None):
+def gameplay_crop(video, facecam):
+    """Remove a camera confined entirely to a narrow outside edge."""
+    width, height = video["width"], video["height"]
+    camera_width, _, x, _ = facecam
+    limit = width * 0.125
+    left = x + camera_width
+    right = width - x
+    if 0 < left <= limit:
+        return width - left, height, left, 0
+    if 0 < right <= limit:
+        return width - right, height, 0, 0
+    return None
+
+
+def safe_layout(video, facecam=None, emphasis=None):
     width, height = video["width"], video["height"]
     if abs(width / height - 9 / 16) < 0.015:
         return "[0:v]scale=1080:1920,setsar=1,ass=captions.ass[v]"
     foreground_height = 820 if facecam else 1920
+    crop = gameplay_crop(video, facecam) if facecam else None
+    gameplay = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     backdrop = (
         "[back]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
         "gblur=sigma=18,eq=brightness=-0.19,scale=1080:1920[background];"
-        f"[front]scale=1080:{foreground_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[foreground];"
+        f"[front]{gameplay}scale=1080:{foreground_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[foreground];"
     )
     if facecam:
         width, height, x, y = facecam
         return (
             "[0:v]split=3[back][front][cam];" + backdrop
-            + f"[cam]crop={width}:{height}:{x}:{y},scale=972:648,setsar=1[camera];"
-            "[background][foreground]overlay=(W-w)/2:780[main];"
-            "[main][camera]overlay=54:88,setsar=1,ass=captions.ass[v]"
+            + f"[cam]crop={width}:{height}:{x}:{y},scale=972:648,setsar=1"
+            + (f",eq=brightness=0.035:contrast=1.05:enable='between(t,{emphasis[0]:.3f},{emphasis[1]:.3f})'" if emphasis else "")
+            + "[camera];[background][foreground]overlay=(W-w)/2:810[main];"
+            "[main][camera]overlay=54:125,setsar=1,ass=captions.ass[v]"
         )
     return (
         "[0:v]split[back][front];"
@@ -408,15 +486,19 @@ def safe_layout(video, facecam=None):
     )
 
 
-def metadata(job, words, moment, release=None):
-    surge = release is not None
-    corroborated = surge and any(
+def speech_overlaps_reaction(words, moment, release):
+    return release is not None and any(
         word["confidence"] >= 0.80
         and word["text"] != "[unclear]"
         and any(letter.isalnum() for letter in word["text"])
         and min(word["end"], release + 0.10) > max(word["start"], moment - 0.10)
         for word in words
     )
+
+
+def metadata(job, words, moment, release=None, *, duration=None, picture_ok=True):
+    surge = release is not None
+    corroborated = speech_overlaps_reaction(words, moment, release)
     creator = job["creator"]
     nearby = [w for w in words if moment-4 <= w["start"] <= moment+4]
     phrases = []
@@ -456,8 +538,103 @@ def metadata(job, words, moment, release=None):
     caption = f'"{excerpt}"' if excerpt else f"A reaction from {creator}'s stream."
     description = f"{caption}\n\nWatch {creator} live: https://www.twitch.tv/{creator}"
     description += "\n\n" + " ".join(hashtags)
+    hook = f"“{excerpt}”" if corroborated and 10 <= len(excerpt) <= 45 and moment >= 1.0 else ""
+    reasons = []
+    if not corroborated:
+        reasons.append("No clear speech during the reaction.")
+    if not picture_ok:
+        reasons.append("The opening or payoff is too dark, static, or unavailable.")
+    if duration is not None:
+        opening_captions = any(start <= 1.0 for start, _, _ in caption_groups(words, duration))
+        if moment > 1.0 and not opening_captions and not hook:
+            reasons.append("No clear opening context.")
+        if release is not None and duration - release > 3.0:
+            reasons.append("The edit runs too long after the reaction.")
+        if moment > 6.0:
+            reasons.append("The reaction takes too long to arrive.")
     return {"title": title, "description": description, "hashtags": hashtags,
-            "quality_version": 2 if corroborated else 0}
+            "quality_version": 2 if corroborated else 0, "opening_hook": hook,
+            "editorial_pass": not reasons, "editorial_reasons": reasons,
+            "reaction_start_seconds": round(moment, 3) if surge else None,
+            "reaction_end_seconds": round(release, 3) if surge else None}
+
+
+def usable_picture(path, offset, duration, reaction):
+    """Check sampled opening and payoff frames for legible picture and activity."""
+    import cv2
+    capture = cv2.VideoCapture(str(path))
+    try:
+        for times in ((0, 0.35, 0.7), (reaction, min(duration - .15, reaction + .35), min(duration - .10, reaction + .7))):
+            frames = []
+            for second in times:
+                capture.set(cv2.CAP_PROP_POS_MSEC, (offset + second) * 1000)
+                ok, frame = capture.read()
+                if not ok:
+                    return False
+                gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+                frames.append(gray)
+            if max(frame.mean() for frame in frames) < 22:
+                return False
+            if max(cv2.absdiff(a, b).mean() for a, b in zip(frames, frames[1:])) < 1.8:
+                return False
+        return True
+    finally:
+        capture.release()
+
+
+def select_edit(job, master, source_offset, available, words, evidence, start, end):
+    """Repair a weak opening or long tail when the source offers a better window."""
+    onset = evidence["peak"]
+    release = evidence["release"] if evidence["surge"] else None
+
+    def evaluate(left, right):
+        duration = right - left
+        excerpt = [
+            dict(word, start=max(0, word["start"]-left), end=min(duration, word["end"]-left))
+            for word in words if word["start"] >= left-0.001 and word["end"] <= right+0.001
+        ]
+        try:
+            picture_ok = usable_picture(master, source_offset + left, duration, onset - left)
+        except Exception as error:
+            print(f"Editorial picture check failed: {error}", file=sys.stderr)
+            picture_ok = False
+        details = metadata(job, excerpt, onset-left, release-left if release is not None else None,
+                           duration=duration, picture_ok=picture_ok)
+        return left, right, excerpt, details
+
+    best = evaluate(start, end)
+    if best[3]["editorial_pass"] or not speech_overlaps_reaction(words, onset, release):
+        return best
+
+    minimum = job["min_seconds"]
+    maximum = job["max_seconds"]
+    preferred_end = min(available, release + 1.15)
+    speech = [word for word in words if word["confidence"] >= .55 and word["text"] != "[unclear]"]
+    edges = {start, max(0, onset-6), max(0, onset-1)}
+    for word in speech:
+        if start-1 <= word["start"] <= onset-0.65:
+            edges.update((max(0, word["start"]-.10), word["start"], word["end"]))
+    edges.update(max(0, start + step/4) for step in range(-4, 13))
+    candidates = set()
+    for left in edges:
+        if not 0.65 <= onset-left <= 6 or any(word["start"] < left < word["end"] for word in speech):
+            continue
+        right = max(left + minimum, preferred_end)
+        while any(word["start"] < right < word["end"] for word in speech):
+            right = max(word["end"] + .08 for word in speech if word["start"] < right < word["end"])
+        if right <= min(available, left + maximum, release+3) and (left, right) != (start, end):
+            candidates.add((left, right))
+    ordered = sorted(candidates, key=lambda pair: (
+        abs(pair[0]-start) + abs(pair[1]-preferred_end) * 2, pair[0], pair[1],
+    ))
+    for left, right in ordered[:8]:
+        candidate = evaluate(left, right)
+        if candidate[3]["editorial_pass"]:
+            return candidate
+        if (candidate[3]["quality_version"] == 2
+                and len(candidate[3]["editorial_reasons"]) < len(best[3]["editorial_reasons"])):
+            best = candidate
+    return best
 
 
 def produce(job):
@@ -505,11 +682,16 @@ def produce(job):
     words = transcribe(load_model(Path(job["model_cache"])), waveform)
     evidence = {}
     start, end = choose_window(waveform, 20, job["min_seconds"], job["max_seconds"], words, evidence=evidence)
+    with wave.open(str(waveform), "rb") as audio:
+        analysis_seconds = audio.getnframes() / audio.getframerate()
+    start, end, words, details = select_edit(
+        job, master, offset, analysis_seconds, words, evidence, start, end,
+    )
     duration = end - start
     offset += start
-    words = [dict(word, start=max(0, word["start"]-start), end=min(duration, word["end"]-start))
-             for word in words if word["start"] >= start-0.001 and word["end"] <= end+0.001]
-    write_captions(folder, words, duration)
+    moment = evidence["peak"] - start
+    release = evidence["release"] - start if evidence["surge"] else None
+    write_captions(folder, words, duration, hook=details["opening_hook"])
     (folder / "transcript.json").write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
     rate_fields = video["r_frame_rate"].split("/")
     rate = int(rate_fields[0]) / max(1, int(rate_fields[1]))
@@ -522,10 +704,10 @@ def produce(job):
         print(f"Facecam analysis failed: {error}", file=sys.stderr)
         facecam = None
     ffmpeg("-ss", f"{offset:.3f}", "-i", master, "-t", f"{duration:.3f}",
-           "-filter_complex_threads", "2", "-filter_complex", safe_layout(video, facecam),
+           "-filter_complex_threads", "2", "-filter_complex", safe_layout(video, facecam, (moment, release) if release is not None else None),
            "-map", "[v]", "-map", "0:a:0", "-c:v", "libx264", "-preset", "slow",
            "-crf", "17", "-pix_fmt", "yuv420p", "-r", f"{fps:.6f}", "-threads", "4",
-           "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", temporary, cwd=folder)
+           "-af", "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=48000", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", temporary, cwd=folder)
     duration, _ = validate_video(temporary, duration)
     combined_size = master.stat().st_size + temporary.stat().st_size
     if combined_size > job.get("remaining_saved_bytes", float("inf")):
@@ -543,8 +725,7 @@ def produce(job):
         "start_offset_ms": round(start * 1000),
         "duration_ms": round(duration * 1000),
         "saved_bytes": combined_size,
-        "metadata": metadata(job, words, evidence["peak"] - start,
-                             evidence["release"] - start if evidence["surge"] else None),
+        "metadata": details,
     }
 
 
